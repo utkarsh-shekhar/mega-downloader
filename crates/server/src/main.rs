@@ -72,6 +72,10 @@ async fn main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&dest).await.ok();
     tracing::info!("download directory: {}", dest.display());
 
+    // Seed container-friendly defaults from env into the DB on first boot
+    // (e.g. the homelab compose sets these; the UI remains authoritative after).
+    seed_env_to_settings(&pool).await;
+
     let (events, _) = broadcast::channel::<EngineEvent>(1024);
     let state = AppState {
         pool,
@@ -96,6 +100,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/jobs/{id}/resume", post(routes::resume_job))
         .route("/api/jobs/{id}/status", get(routes::job_status))
         .route("/api/jobs/{id}/zip", get(routes::job_zip))
+        .route("/api/path-mappings", get(routes::list_path_mappings).post(routes::add_path_mapping))
+        .route("/api/path-mappings/{id}", axum::routing::delete(routes::delete_path_mapping))
+        .route("/api/aria2/status", get(routes::aria2_status))
         .route("/ws", get(ws::handler))
         // Only our own UIs may call the engine cross-origin: the Vite dev
         // server and the packaged Tauri webview. A permissive CORS here would
@@ -125,6 +132,56 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+/// If env vars are provided and a given setting doesn't exist yet, write it,
+/// so a container gets sensible defaults on first run without the UI. This
+/// also auto-creates a remote path mapping when both sides are provided and no
+/// mapping exists yet (the Sonarr/Radarr "remote path mapping" seed).
+async fn seed_env_to_settings(pool: &sqlx::SqlitePool) {
+    for (key, env) in [
+        ("aria2_rpc_url", "ARIA2_RPC_URL"),
+        ("aria2_rpc_secret", "ARIA2_SECRET"),
+        ("max_download_speed", "MAX_DOWNLOAD_SPEED"),
+        ("download_dir", "DOWNLOAD_DIR"),
+    ] {
+        if let Ok(v) = std::env::var(env) {
+            if !v.trim().is_empty() {
+                sqlx::query(
+                    "INSERT INTO settings (key, value) VALUES (?, ?)
+                     ON CONFLICT(key) DO NOTHING",
+                )
+                .bind(key)
+                .bind(v.trim())
+                .execute(pool)
+                .await
+                .ok();
+            }
+        }
+    }
+
+    // Seed a default path mapping from env if none exist yet.
+    let remote = std::env::var("ARIA2_REMOTE_PATH").ok();
+    let local = std::env::var("ARIA2_LOCAL_PATH").ok();
+    if let (Some(r), Some(l)) = (remote, local) {
+        if !r.trim().is_empty() && !l.trim().is_empty() {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM path_mappings")
+                .fetch_one(pool)
+                .await
+                .unwrap_or(0);
+            if count == 0 {
+                sqlx::query(
+                    "INSERT INTO path_mappings (remote_path, local_path, position) VALUES (?, ?, 0)",
+                )
+                .bind(r.trim())
+                .bind(l.trim())
+                .execute(pool)
+                .await
+                .ok();
+                tracing::info!("seeded path mapping {r} -> {l}");
+            }
+        }
+    }
 }
 
 /// On startup, continue downloading any jobs left actively running. Jobs the

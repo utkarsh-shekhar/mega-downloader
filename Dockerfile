@@ -47,7 +47,7 @@ RUN cargo build --release -p server \
 # certificates to reach MEGA + Real-Debrid over HTTPS.
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates tzdata \
+    && apt-get install -y --no-install-recommends ca-certificates tzdata curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

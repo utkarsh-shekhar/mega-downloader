@@ -23,8 +23,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::events::EngineEvent;
+use crate::aria2::{AddUriOptions, Aria2Client, AriaConfig};
 use crate::mega::{self, crypto, MegaLink, NodeKind, Tree};
 use crate::realdebrid::RealDebrid;
+use crate::PathMapping;
 use crate::{Error, Result};
 
 /// MEGA encrypts file contents with AES-128 in CTR mode (big-endian counter).
@@ -58,6 +60,12 @@ pub struct Downloader {
     rd: RealDebrid,
     dest_root: PathBuf,
     concurrency: usize,
+    /// Optional Aria2 backend (rate-limited downloads + AriaNg visibility).
+    aria2: Option<Aria2Client>,
+    /// Path mappings used to translate Aria2-reported paths to local paths.
+    path_mappings: std::sync::Arc<std::sync::RwLock<Vec<PathMapping>>>,
+    /// Default per-download speed limit (aria2 format, e.g. "5M", "0"=unlimited).
+    max_download_speed: Option<String>,
 }
 
 impl Downloader {
@@ -74,7 +82,29 @@ impl Downloader {
             rd,
             dest_root,
             concurrency: concurrency.clamp(1, 16),
+            aria2: None,
+            path_mappings: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
+            max_download_speed: None,
         }
+    }
+
+    /// Configure the Aria2 backend. Pass `None` to keep using the built-in
+    /// streamer for everything.
+    pub fn with_aria2(&mut self, cfg: &AriaConfig) -> &mut Self {
+        self.aria2 = Aria2Client::from_config(cfg);
+        self.max_download_speed = cfg.max_download_limit.clone();
+        self
+    }
+
+    /// Set the remote→local path mappings (for moving Aria2-completed files).
+    pub fn set_path_mappings(&mut self, mappings: Vec<PathMapping>) -> &mut Self {
+        *self.path_mappings.write().unwrap() = mappings;
+        self
+    }
+
+    /// True when an Aria2 client is configured (RD downloads go through it).
+    pub fn aria2_enabled(&self) -> bool {
+        self.aria2.is_some()
     }
 
     fn emit(&self, ev: EngineEvent) {
@@ -348,17 +378,13 @@ impl Downloader {
             "https://mega.nz/folder/{folder_id}#{folder_key}/file/{}",
             task.handle
         );
-        let result = self
-            .try_download(
-                job_id,
-                &task.transfer_id,
-                &task.handle,
-                &link,
-                &path,
-                task.size,
-                cancel,
-            )
-            .await;
+        let result = if self.aria2_enabled() {
+            self.download_rd_via_aria2(job_id, &task, &link, &path, cancel)
+                .await
+        } else {
+            self.try_download(job_id, &task.transfer_id, &task.handle, &link, &path, task.size, cancel)
+                .await
+        };
 
         let err = match result {
             Ok(()) => {
@@ -533,6 +559,194 @@ impl Downloader {
         });
         self.finish(job_id, transfer_id, handle, downloaded).await?;
         Ok(())
+    }
+
+    /// Route a Real-Debrid download through Aria2 (rate-limited, visible in
+    /// AriaNg). The bytes land flat in Aria2's download area; when Aria2
+    /// reports completion we translate its path with the remote path mapping
+    /// and move the file into the correct nested MEGA folder (rename same-fs,
+    /// copy+remove cross-fs).
+    #[allow(clippy::too_many_arguments)]
+    async fn download_rd_via_aria2(
+        &self,
+        job_id: &str,
+        task: &FileTask,
+        link: &str,
+        final_path: &Path,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let aria2 = self.aria2.as_ref().expect("aria2 enabled");
+
+        // Fast path: final file already on disk.
+        if task.size > 0 && file_len(final_path).await == task.size {
+            return self
+                .finish(job_id, &task.transfer_id, &task.handle, task.size)
+                .await;
+        }
+
+        // 1. Unrestrict the Real-Debrid link (gives a short-lived plaintext URL).
+        let unrestricted = self.rd.unrestrict(link).await?;
+        let total = if unrestricted.filesize > 0 {
+            unrestricted.filesize
+        } else {
+            task.size
+        };
+
+        // 2. Work out where Aria2 should write the file. We keep it inside the
+        //    job's sub-dir under Aria2's root; the remote→local mapping later
+        //    tells us where that is on this filesystem.
+        let aria2_root = self.aria2_root();
+        let filename = task
+            .rel_path
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .next_back()
+            .map(sanitize_segment)
+            .unwrap_or_else(|| format!("{}.part", task.handle));
+        let aria2_dir = PathBuf::from(&aria2_root).join(format!("job-{}", &job_id[..8.min(job_id.len())]));
+
+        // Existing partial (Aria2 uses .aria2 control files for resume, so a
+        // prior attempt just resumes; we only modify the DB state).
+        let _ = sqlx::query(
+            "UPDATE transfers SET status='active', source='aria2', updated_at=datetime('now') WHERE id=?",
+        )
+        .bind(&task.transfer_id)
+        .execute(&self.pool)
+        .await;
+
+        let opts = AddUriOptions {
+            dir: aria2_dir.to_string_lossy().to_string(),
+            max_download_limit: self.max_download_speed.clone(),
+            max_connection_per_server: Some("1".into()), // RD limits per-conn
+            continue_field: Some("true".into()),
+            title: Some(task.rel_path.clone()),
+            ..Default::default()
+        };
+        let gid = aria2
+            .add_uri(&[unrestricted.download.clone()], opts)
+            .await?;
+        let _ = sqlx::query("UPDATE transfers SET aria2_gid=?, updated_at=datetime('now') WHERE id=?")
+            .bind(&gid)
+            .bind(&task.transfer_id)
+            .execute(&self.pool)
+            .await;
+
+        // 3. Poll until Aria2 finishes (or we're cancelled / the job is paused).
+        let downloaded = self.poll_aria2_file(job_id, task, &gid, total, cancel).await?;
+
+        // 4. Move Aria2's file into the correct nested MEGA folder.
+        let finished_path = {
+            let status = aria2.tell_status(&gid).await?;
+            status
+                .files
+                .first()
+                .map(|f| f.path.clone())
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| aria2_dir.join(&filename).to_string_lossy().to_string())
+        };
+        let local_src = self.map_aria2_path(&finished_path);
+        self.ensure_parents(final_path).await;
+        move_file(&local_src, final_path).await?;
+
+        self.emit(EngineEvent::Progress {
+            job_id: job_id.into(),
+            handle: task.handle.clone(),
+            bytes_done: downloaded,
+            bytes_total: total.max(downloaded),
+        });
+        self.finish(job_id, &task.transfer_id, &task.handle, downloaded)
+            .await?;
+        Ok(())
+    }
+
+    /// The directory Aria2 downloads into, as the *remote* (Aria2-side) path.
+    /// The first configured path mapping gives the local equivalent; if no
+    /// mapping is set we assume Aria2 and this engine share the download dir.
+    fn aria2_root(&self) -> String {
+        let mappings = self.path_mappings.read().unwrap();
+        mappings
+            .first()
+            .map(|m| m.remote_path.clone())
+            .unwrap_or_else(|| self.dest_root.to_string_lossy().to_string())
+    }
+
+    /// Translate an Aria2-reported absolute path to a local path this engine
+    /// can open, using the configured remote path mappings.
+    fn map_aria2_path(&self, aria2_path: &str) -> PathBuf {
+        let mappings = self.path_mappings.read().unwrap();
+        crate::pathmap::resolve_mapping(&mappings, aria2_path).unwrap_or_else(|| {
+            PathBuf::from(aria2_path)
+        })
+    }
+
+    /// Create parent dirs for a destination path (best-effort).
+    async fn ensure_parents(&self, path: &Path) {
+        if let Some(parent) = path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+    }
+
+    /// Poll a single Aria2 gid until it completes or errors (or we're
+    /// cancelled). Returns bytes downloaded.
+    async fn poll_aria2_file(
+        &self,
+        job_id: &str,
+        task: &FileTask,
+        gid: &str,
+        total: i64,
+        cancel: &CancellationToken,
+    ) -> Result<i64> {
+        let aria2 = self.aria2.as_ref().expect("aria2 enabled");
+        let mut last_progress = Instant::now();
+        loop {
+            let status = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    // Paused/stopped: leave Aria2 running in place; it will
+                    // resume next time. Mark transfer paused for the UI.
+                    let _ = sqlx::query("UPDATE transfers SET status='paused', updated_at=datetime('now') WHERE id=?")
+                        .bind(&task.transfer_id).execute(&self.pool).await;
+                    return Err(Error::Cancelled);
+                }
+                s = aria2.tell_status(gid) => match s {
+                    Ok(st) => st,
+                    Err(_) => {
+                        // Transient RPC hiccup — retry after a short pause.
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        continue;
+                    }
+                },
+            };
+
+            let done = status.completed_length.parse::<i64>().unwrap_or(0);
+            match status.status.as_str() {
+                "complete" => {
+                    return Ok(done);
+                }
+                "error" => {
+                    let code = status.error_code.unwrap_or_default();
+                    let msg = base64_err(&status.error_message.unwrap_or_default()); // Aria2 base64-encodes these
+                    return Err(Error::Other(format!(
+                        "aria2 error (code {code}): {msg}"
+                    )));
+                }
+                "removed" => return Err(Error::Other("aria2 download removed".into())),
+                _ => {
+                    // active / waiting / paused — report progress periodically.
+                    if last_progress.elapsed() >= PROGRESS_INTERVAL {
+                        self.persist_progress(&task.transfer_id, done).await;
+                        self.emit(EngineEvent::Progress {
+                            job_id: job_id.into(),
+                            handle: task.handle.clone(),
+                            bytes_done: done,
+                            bytes_total: total.max(done),
+                        });
+                        last_progress = Instant::now();
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        }
     }
 
     /// A single download attempt: unrestrict, stream (resuming if a partial file
@@ -730,6 +944,36 @@ async fn file_len(path: &Path) -> i64 {
         .await
         .map(|m| m.len() as i64)
         .unwrap_or(0)
+}
+
+/// Move (or copy+remove) `src` to `dst`. A plain rename is atomic and instant
+/// on the same filesystem; if the two paths are on different filesystems
+/// (cross-fs rename fails with EXDEV) we copy then remove the source.
+async fn move_file(src: &Path, dst: &Path) -> Result<()> {
+    match tokio::fs::rename(src, dst).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(18 /* EXDEV */) => {
+            tracing::warn!("cross-filesystem move {src:?} -> {dst:?}; copying");
+            let _ = tokio::fs::remove_file(dst).await;
+            tokio::fs::copy(src, dst).await.map_err(Error::Io)?;
+            tokio::fs::remove_file(src).await.map_err(Error::Io)?;
+            Ok(())
+        }
+        Err(e) => Err(Error::Io(e)),
+    }
+}
+
+/// Aria2 base64-encodes `error_message`/`error_code` fields; decode best-effort.
+fn base64_err(s: &str) -> String {
+    if s.is_empty() {
+        return s.to_string();
+    }
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_else(|| s.to_string())
 }
 
 /// Map a tree `rel_path` to its sanitized on-disk path under `dest_root`.

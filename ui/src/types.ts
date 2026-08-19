@@ -50,6 +50,14 @@ export interface TransferState {
   status: string; // queued | active | done | error
 }
 
+/** Remote path mapping (Aria2-reported → local), the Sonarr/Radarr pattern. */
+export interface PathMapping {
+  id?: number;
+  remote_path: string;
+  local_path: string;
+  position?: number;
+}
+
 /** Build the UI progress map from a job's persisted transfer states. */
 export function transfersToProgress(
   transfers: Record<string, TransferState>,

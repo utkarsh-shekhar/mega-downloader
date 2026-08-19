@@ -50,6 +50,9 @@ pub struct SettingsReq {
     pub rd_token: Option<String>,
     pub download_dir: Option<String>,
     pub concurrency: Option<u32>,
+    pub aria2_rpc_url: Option<String>,
+    pub aria2_rpc_secret: Option<String>,
+    pub max_download_speed: Option<String>,
 }
 
 /// Persist settings: Real-Debrid token, download directory, and concurrency.
@@ -74,6 +77,21 @@ pub async fn save_settings(
             .await
             .map_err(internal_sqlx)?;
     }
+    if let Some(u) = req.aria2_rpc_url {
+        upsert_or_clear(&state.pool, "aria2_rpc_url", u.trim())
+            .await
+            .map_err(internal_sqlx)?;
+    }
+    if let Some(secret) = req.aria2_rpc_secret {
+        upsert_or_clear(&state.pool, "aria2_rpc_secret", secret.trim())
+            .await
+            .map_err(internal_sqlx)?;
+    }
+    if let Some(speed) = req.max_download_speed {
+        upsert_or_clear(&state.pool, "max_download_speed", speed.trim())
+            .await
+            .map_err(internal_sqlx)?;
+    }
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -84,10 +102,28 @@ pub async fn get_settings(State(state): State<AppState>) -> Json<Value> {
         .ok()
         .flatten()
         .is_some();
+    let aria2_url = get_setting(&state.pool, "aria2_rpc_url")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let aria2_secret_set = get_setting(&state.pool, "aria2_rpc_secret")
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    let max_speed = get_setting(&state.pool, "max_download_speed")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     Json(json!({
         "rd_token_set": token_set,
         "download_dir": resolve_dest(&state.pool).await.to_string_lossy(),
         "concurrency": resolve_concurrency(&state.pool).await,
+        "aria2_rpc_url": aria2_url,
+        "aria2_rpc_secret_set": aria2_secret_set,
+        "max_download_speed": max_speed,
     }))
 }
 
@@ -110,6 +146,87 @@ pub async fn resolve_concurrency(pool: &SqlitePool) -> usize {
         .unwrap_or(engine::download::DEFAULT_CONCURRENCY)
 }
 
+/// GET /api/path-mappings — list remote path mappings.
+pub async fn list_path_mappings(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({ "mappings": path_mappings_all(&state.pool).await }))
+}
+
+#[derive(Deserialize)]
+pub struct PathMappingReq {
+    pub remote_path: String,
+    pub local_path: String,
+}
+
+/// POST /api/path-mappings — add a mapping.
+pub async fn add_path_mapping(
+    State(state): State<AppState>,
+    Json(req): Json<PathMappingReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let remote = engine::pathmap::normalize(&req.remote_path);
+    let local = engine::pathmap::normalize(&req.local_path);
+    if remote.is_empty() || local.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "remote_path and local_path are required".into(),
+        ));
+    }
+    let position: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM path_mappings")
+        .fetch_one(&state.pool)
+        .await
+        .map_err(internal_sqlx)?;
+    let id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO path_mappings (remote_path, local_path, position) VALUES (?, ?, ?) RETURNING id",
+    )
+    .bind(&remote)
+    .bind(&local)
+    .bind(position)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(internal_sqlx)?;
+    Ok(Json(json!({ "ok": true, "id": id })))
+}
+
+/// DELETE /api/path-mappings/{id} — remove a mapping.
+pub async fn delete_path_mapping(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let affected = sqlx::query("DELETE FROM path_mappings WHERE id = ?")
+        .bind(id)
+        .execute(&state.pool)
+        .await
+        .map_err(internal_sqlx)?
+        .rows_affected();
+    if affected == 0 {
+        return Err((StatusCode::NOT_FOUND, format!("no mapping with id {id}")));
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// GET /api/aria2/status — probe Aria2 connectivity + report speed limit.
+pub async fn aria2_status(State(state): State<AppState>) -> Json<Value> {
+    match aria2_config(&state.pool).await {
+        Some(cfg) => {
+            match engine::aria2::Aria2Client::from_config(&cfg) {
+                Some(client) => match client.get_version().await {
+                    Ok(v) => Json(json!({
+                        "connected": true,
+                        "version": v,
+                        "max_download_speed": cfg.max_download_limit,
+                    })),
+                    Err(e) => Json(json!({
+                        "connected": false,
+                        "error": e.to_string(),
+                        "max_download_speed": cfg.max_download_limit,
+                    })),
+                },
+                None => Json(json!({ "connected": false, "configured": true, "error": "invalid Aria2 config" })),
+            }
+        }
+        None => Json(json!({ "connected": false, "configured": false })),
+    }
+}
+
 /// Build a Downloader writing to `dest` at the current concurrency setting.
 pub async fn build_downloader(
     state: &AppState,
@@ -117,13 +234,22 @@ pub async fn build_downloader(
     dest: std::path::PathBuf,
 ) -> Downloader {
     let concurrency = resolve_concurrency(&state.pool).await;
-    Downloader::new(
+    let mut dl = Downloader::new(
         state.pool.clone(),
         state.events.clone(),
         RealDebrid::new(token),
         dest,
         concurrency,
-    )
+    );
+    // Wire up the optional Aria2 backend + remote path mappings from settings.
+    if let Some(aria2_cfg) = aria2_config(&state.pool).await {
+        dl.with_aria2(&aria2_cfg);
+    }
+    let mappings = path_mappings_all(&state.pool).await;
+    if !mappings.is_empty() {
+        dl.set_path_mappings(mappings);
+    }
+    dl
 }
 
 /// The destination a job was created with, so resume/retry write to the same
@@ -597,6 +723,66 @@ pub fn spawn_job(state: AppState, downloader: Downloader, job_id: String) -> boo
         state.jobs.lock().unwrap().remove(&job_id);
     });
     true
+}
+
+// --- Aria2 / path mapping ---------------------------------------------------
+
+/// Load the effective Aria2 config from settings + env. Returns `None` when no
+/// RPC URL is configured (Aria2 backend disabled → built-in streamer).
+pub async fn aria2_config(pool: &SqlitePool) -> Option<engine::aria2::AriaConfig> {
+    // Env vars seed the defaults; the DB (UI) overrides them.
+    let url = get_setting(pool, "aria2_rpc_url")
+        .await
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("ARIA2_RPC_URL").ok())
+        .and_then(|s| {
+            let s = s.trim().to_string();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        })?;
+
+    let secret = get_setting(pool, "aria2_rpc_secret")
+        .await
+        .ok()
+        .flatten()
+        .or_else(|| std::env::var("ARIA2_SECRET").ok())
+        .or_else(|| std::env::var("ARIA2_RPC_SECRET").ok());
+    let speed = get_setting(pool, "max_download_speed")
+        .await
+        .ok()
+        .flatten()
+        .or_else(|| std::env::var("MAX_DOWNLOAD_SPEED").ok())
+        .filter(|s| !s.trim().is_empty());
+
+    Some(engine::aria2::AriaConfig {
+        rpc_url: Some(url),
+        secret,
+        // Default cap when unset: 5 MiB/s (editable in the UI).
+        max_download_limit: Some(speed.unwrap_or_else(|| "5M".to_string())),
+    })
+}
+
+/// Load all path mappings ordered by position.
+pub async fn path_mappings_all(pool: &SqlitePool) -> Vec<engine::PathMapping> {
+    sqlx::query_as::<_, (i64, String, String, i64)>(
+        "SELECT id, remote_path, local_path, position FROM path_mappings ORDER BY position, id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(id, remote_path, local_path, position)| engine::PathMapping {
+        id: Some(id),
+        remote_path,
+        local_path,
+        position,
+    })
+    .collect()
 }
 
 // --- settings helpers -------------------------------------------------------

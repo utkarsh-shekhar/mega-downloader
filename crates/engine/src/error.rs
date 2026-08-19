@@ -23,6 +23,16 @@ pub enum Error {
         message: String,
     },
 
+    #[error("aria2 rpc error ({method}, code {code}): {message}")]
+    Aria2 {
+        method: String,
+        code: i64,
+        message: String,
+    },
+
+    #[error("serialization error: {0}")]
+    Json(#[from] serde_json::Error),
+
     #[error("incomplete download: got {got} of {expected} bytes")]
     Incomplete { got: i64, expected: i64 },
 

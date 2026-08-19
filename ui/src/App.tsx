@@ -5,6 +5,7 @@ import {
   formatBytes,
   formatDuration,
   parseMegaLinks,
+  type PathMapping,
   transfersToProgress,
   type JobSummary,
   type ProgressMap,
@@ -31,6 +32,12 @@ export default function App() {
   const [tokenInput, setTokenInput] = useState("");
   const [dirInput, setDirInput] = useState("");
   const [concInput, setConcInput] = useState(4);
+  const [aria2Url, setAria2Url] = useState("");
+  const [aria2Secret, setAria2Secret] = useState("");
+  const [aria2SecretSet, setAria2SecretSet] = useState(false);
+  const [maxSpeed, setMaxSpeed] = useState("");
+  const [aria2Status, setAria2Status] = useState<string | null>(null);
+  const [pathMappings, setPathMappings] = useState<PathMapping[]>([]);
   const [savedMsg, setSavedMsg] = useState(false);
 
   const [speed, setSpeed] = useState(0);
@@ -92,6 +99,27 @@ export default function App() {
         setTokenSet(!!s.rd_token_set);
         setDirInput(s.download_dir ?? "");
         setConcInput(s.concurrency ?? 4);
+        setAria2Url(s.aria2_rpc_url ?? "");
+        setAria2SecretSet(!!s.aria2_rpc_secret_set);
+        setMaxSpeed(s.max_download_speed || "5M");
+      })
+      .catch(() => {});
+  }, []);
+
+  const fetchPathMappings = useCallback(() => {
+    f("/api/path-mappings")
+      .then((r) => r.json())
+      .then((d) => setPathMappings(d.mappings ?? []))
+      .catch(() => {});
+  }, []);
+
+  const refreshAria2Status = useCallback(() => {
+    f("/api/aria2/status")
+      .then((r) => r.json())
+      .then((s) => {
+        if (s.connected) setAria2Status(`Aria2 connected · ${s.version} · limit ${s.max_download_speed || "unlimited"}`);
+        else if (s.configured) setAria2Status(`Aria2 unreachable${s.error ? ` (${s.error})` : ""}`);
+        else setAria2Status("Aria2 not configured");
       })
       .catch(() => {});
   }, []);
@@ -99,11 +127,13 @@ export default function App() {
   useEffect(() => {
     refreshSettings();
     fetchJobs();
+    fetchPathMappings();
+    refreshAria2Status();
     // Restore the last-viewed job across reloads.
     const last = localStorage.getItem(LAST_JOB_KEY);
     if (last) openJob(last);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refreshSettings, fetchJobs]);
+  }, [refreshSettings, fetchJobs, fetchPathMappings, refreshAria2Status]);
 
   // Download-speed sampling for the selected job (updates as the list polls).
   useEffect(() => {
@@ -204,17 +234,41 @@ export default function App() {
     const body: Record<string, unknown> = {
       download_dir: dirInput.trim(),
       concurrency: Math.min(16, Math.max(1, concInput || 4)),
+      aria2_rpc_url: aria2Url.trim(),
+      max_download_speed: maxSpeed.trim() || "5M",
     };
     if (tokenInput.trim()) body.rd_token = tokenInput.trim();
+    if (aria2Secret.trim()) body.aria2_rpc_secret = aria2Secret.trim();
     await f("/api/settings", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
     setTokenInput("");
+    setAria2Secret("");
     refreshSettings();
+    refreshAria2Status();
     setSavedMsg(true);
     setTimeout(() => setSavedMsg(false), 1500);
+  };
+
+  const addMapping = async () => {
+    const remote = prompt("Aria2 path prefix (as Aria2 sees it)", "/rdtdownloads");
+    if (!remote) return;
+    const local = prompt("Local path prefix (same folder on this host)", "/mnt/media/media/rdtdownloads");
+    if (!local) return;
+    await f("/api/path-mappings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ remote_path: remote.trim(), local_path: local.trim() }),
+    });
+    fetchPathMappings();
+  };
+
+  const removeMapping = async (id?: number) => {
+    if (id === undefined) return;
+    await f(`/api/path-mappings/${id}`, { method: "DELETE" });
+    fetchPathMappings();
   };
 
   // Preview the structure of the first pasted link (listing is free/unmetered).
@@ -386,6 +440,97 @@ export default function App() {
               />
             </label>
           </div>
+
+          {/* Aria2 backend */}
+          <div className="space-y-3 border-t border-neutral-800 pt-3">
+            <div className="flex items-center justify-between">
+              <span className="text-xs uppercase tracking-wide text-neutral-500">Aria2 download backend</span>
+              {aria2Status && (
+                <span className={`text-xs ${aria2Status.startsWith("Aria2 connected") ? "text-emerald-400" : "text-amber-400"}`}>
+                  {aria2Status}
+                </span>
+              )}
+            </div>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+              <label className="text-sm text-neutral-400">
+                RPC URL
+                <input
+                  value={aria2Url}
+                  onChange={(e) => setAria2Url(e.target.value)}
+                  placeholder="http://aria2:6800/jsonrpc"
+                  className="mt-1 w-full rounded-md border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm font-mono outline-none focus:border-indigo-500"
+                />
+              </label>
+              <label className="text-sm text-neutral-400">
+                RPC secret{" "}
+                {aria2SecretSet ? <span className="text-emerald-400">● set</span> : <span className="text-rose-400">● not set</span>}
+                <input
+                  type="password"
+                  value={aria2Secret}
+                  onChange={(e) => setAria2Secret(e.target.value)}
+                  placeholder={aria2SecretSet ? "replace secret…" : "rpc-secret"}
+                  className="mt-1 w-full rounded-md border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm font-mono outline-none focus:border-indigo-500"
+                />
+              </label>
+              <label className="text-sm text-neutral-400">
+                Max download speed (per file)
+                <input
+                  value={maxSpeed}
+                  onChange={(e) => setMaxSpeed(e.target.value)}
+                  placeholder="5M · 0 = unlimited"
+                  className="mt-1 w-full rounded-md border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm font-mono outline-none focus:border-indigo-500"
+                />
+              </label>
+            </div>
+            <p className="text-xs text-neutral-500">
+              Leave RPC URL empty to use the built-in downloader. Files are rate-limited and visible in
+              AriaNg; on completion the engine moves them into the correct MEGA folders via the path mappings below.
+            </p>
+          </div>
+
+          {/* Remote path mappings */}
+          <div className="space-y-2 border-t border-neutral-800 pt-3">
+            <div className="flex items-center justify-between">
+              <span className="text-xs uppercase tracking-wide text-neutral-500">Remote path mappings</span>
+              <button
+                onClick={addMapping}
+                className="rounded-md bg-neutral-700 px-2 py-1 text-xs font-medium hover:bg-neutral-600"
+              >
+                + Add
+              </button>
+            </div>
+            {pathMappings.length === 0 ? (
+              <p className="text-xs text-neutral-500">No mappings. Aria2 paths are used as-is.</p>
+            ) : (
+              <table className="w-full text-left text-xs">
+                <thead>
+                  <tr className="text-neutral-500">
+                    <th className="pb-1 font-medium">Aria2 path</th>
+                    <th className="pb-1 font-medium">Local path</th>
+                    <th className="w-8" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {pathMappings.map((m) => (
+                    <tr key={m.id ?? m.remote_path} className="border-t border-neutral-800">
+                      <td className="py-1 pr-2 font-mono text-neutral-300">{m.remote_path}</td>
+                      <td className="py-1 pr-2 font-mono text-neutral-300">{m.local_path}</td>
+                      <td className="py-1 text-right">
+                        <button
+                          onClick={() => removeMapping(m.id)}
+                          className="text-neutral-500 hover:text-rose-400"
+                          aria-label="remove mapping"
+                        >
+                          ✕
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+
           <button onClick={saveSettings} className="rounded-md bg-neutral-700 px-3 py-2 text-sm font-medium hover:bg-neutral-600">
             Save settings
           </button>
