@@ -39,6 +39,10 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 COPY migrations/ ./migrations/
+# Cap rustc parallelism so the release build stays inside modest memory limits
+# (proc-macro crates like synstructure can otherwise exhaust memory and abort
+# with a SIGABRT "memory allocation ... failed" on constrained hosts).
+ENV CARGO_BUILD_JOBS=2
 RUN cargo build --release -p server \
     && cp target/release/mega-downloader /mega-downloader
 
