@@ -4,6 +4,7 @@
 //! this same binary as a Tauri sidecar.
 
 mod routes;
+mod static_files;
 mod ws;
 
 use std::collections::HashMap;
@@ -38,6 +39,16 @@ pub fn download_dir() -> PathBuf {
                 .unwrap_or_default()
                 .join("downloads")
         })
+}
+
+/// Address the engine listens on. `$BIND_ADDR`, defaulting to `127.0.0.1:8787`
+/// (loopback) so a local process isn't reachable from the LAN. Container /
+/// remote deployments should set `BIND_ADDR=0.0.0.0:8787`.
+pub fn bind_addr() -> SocketAddr {
+    std::env::var("BIND_ADDR")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 8787)))
 }
 
 #[tokio::main]
@@ -103,9 +114,12 @@ async fn main() -> anyhow::Result<()> {
                 .allow_headers(Any),
         )
         .layer(TraceLayer::new_for_http())
+        // Self-contained single-process mode: serve the compiled UI from this
+        // same process (mounted after the API/WS routes so those always win).
+        .fallback_service(static_files::fallback(&static_files::ui_dir()))
         .with_state(state);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 8787));
+    let addr = bind_addr();
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("engine listening on http://{addr}");
     axum::serve(listener, app).await?;

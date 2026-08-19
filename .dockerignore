@@ -1,0 +1,31 @@
+# Rust artefacts
+target/
+**/*.rs.bk
+
+# Downloaded content / runtime data
+downloads/
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Node / UI
+ui/node_modules
+ui/dist
+node_modules
+
+# Tauri desktop shell — not part of the container build
+src-tauri/
+
+# Local-only
+NOTES.md
+.env
+.env.local
+.git/
+.gitignore
+.gitattributes
+*.md
+Dockerfile*
+docker-compose*.yml
+run.sh
+backups/

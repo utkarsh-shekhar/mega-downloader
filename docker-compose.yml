@@ -1,0 +1,27 @@
+# Convenience compose file for the self-contained image.
+#
+#   docker compose up -d --build
+#   # open http://localhost:8787
+#
+# Downloads + the SQLite DB persist in the named volume `mega-downloader-data`.
+services:
+  mega-downloader:
+    build: .
+    image: mega-downloader:latest
+    container_name: mega-downloader
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    volumes:
+      - mega-downloader-data:/data
+      # Downloaded files land directly in your host ~/Downloads.
+      - ${HOME}/Downloads:/data/downloads
+    environment:
+      # Listen on all interfaces inside the container; the port mapping above
+      # controls external reachability.
+      BIND_ADDR: "0.0.0.0:8787"
+      DB_PATH: "/data/mega-downloader.db"
+      DOWNLOAD_DIR: "/data/downloads"
+
+volumes:
+  mega-downloader-data:
